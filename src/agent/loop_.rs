@@ -1992,9 +1992,17 @@ fn should_execute_tools_in_parallel(
     }
 
     if let Some(mgr) = approval {
-        if tool_calls.iter().any(|call| mgr.needs_approval(&call.name)) {
-            // Approval-gated calls must keep sequential handling so the caller can
-            // enforce CLI prompt/deny policy consistently.
+        // The approval gate (both remote and local CLI) runs sequentially inside
+        // the for-loop that builds the executable list.  Only local CLI prompts
+        // require sequential *execution* too, because the user is interacting at
+        // the terminal; the execution order must match the prompt order.
+        //
+        // Remote approval does NOT constrain execution order: approvals are
+        // awaited one-at-a-time in the for-loop and the approved tools are then
+        // free to execute concurrently.
+        if !mgr.has_remote_approval()
+            && tool_calls.iter().any(|call| mgr.needs_approval(&call.name))
+        {
             return false;
         }
     }
@@ -2444,24 +2452,103 @@ pub(crate) async fn run_tool_call_loop(
             }
 
             // ── Approval hook ────────────────────────────────
+            //
+            // Two-stage gate when both remote and local approval are configured:
+            //
+            //   Stage 1 — Remote pre-gate (when `remote_approval_url` is set):
+            //     Every tool call is submitted to the remote endpoint FIRST,
+            //     without exception.  A remote rejection immediately denies the
+            //     call; no local check is performed.  A remote approval lets the
+            //     call proceed to Stage 2.
+            //
+            //   Stage 2 — Local supervised-mode check (unchanged behaviour):
+            //     `needs_approval` → CLI prompt (non-CLI channels auto-approve)
+            //     `auto_approve` / session allowlist → proceed silently
+            //
+            // If no remote URL is set only Stage 2 runs.
+            // Both stages must approve for the tool to execute.
             if let Some(mgr) = approval {
+                // ── Stage 1: remote pre-gate ──────────────────
+                if mgr.has_remote_approval() {
+                    // `display_text` is the model's rationale text produced
+                    // alongside this tool call batch — the human-readable
+                    // reason the agent wants to invoke the tool.
+                    let reason = display_text.trim();
+                    let remote_decision = match mgr
+                        .request_remote_approval(&tool_name, reason, &tool_args)
+                        .await
+                    {
+                        Ok(d) => d,
+                        Err(e) => {
+                            tracing::warn!(
+                                tool = %tool_name,
+                                error = %e,
+                                "remote approval request failed; rejecting tool call"
+                            );
+                            ApprovalResponse::No
+                        }
+                    };
+
+                    mgr.record_decision(
+                        &tool_name,
+                        &tool_args,
+                        remote_decision,
+                        "remote",
+                    );
+
+                    if remote_decision == ApprovalResponse::No {
+                        let denied = "Denied by remote approval gate.".to_string();
+                        runtime_trace::record_event(
+                            "tool_call_result",
+                            Some(channel_name),
+                            Some(provider_name),
+                            Some(model),
+                            Some(&turn_id),
+                            Some(false),
+                            Some(&denied),
+                            serde_json::json!({
+                                "iteration": iteration + 1,
+                                "tool": tool_name.clone(),
+                                "arguments": scrub_credentials(&tool_args.to_string()),
+                            }),
+                        );
+                        ordered_results[idx] = Some((
+                            tool_name.clone(),
+                            call.tool_call_id.clone(),
+                            ToolExecutionOutcome {
+                                output: denied.clone(),
+                                success: false,
+                                error_reason: Some(denied),
+                                duration: Duration::ZERO,
+                            },
+                        ));
+                        continue; // remote rejected — skip local check entirely
+                    }
+                    // Remote approved — fall through to Stage 2.
+                }
+
+                // ── Stage 2: local supervised-mode check ──────
                 if mgr.needs_approval(&tool_name) {
                     let request = ApprovalRequest {
                         tool_name: tool_name.clone(),
                         arguments: tool_args.clone(),
                     };
-
                     // Only prompt interactively on CLI; auto-approve on other channels.
-                    let decision = if channel_name == "cli" {
+                    let local_decision = if channel_name == "cli" {
                         mgr.prompt_cli(&request)
                     } else {
                         ApprovalResponse::Yes
                     };
 
-                    mgr.record_decision(&tool_name, &tool_args, decision, channel_name);
+                    mgr.record_decision(
+                        &tool_name,
+                        &tool_args,
+                        local_decision,
+                        channel_name,
+                    );
 
-                    if decision == ApprovalResponse::No {
-                        let denied = "Denied by user.".to_string();
+                    if local_decision == ApprovalResponse::No {
+                        let denied = "Denied by local approval gate.".to_string();
                         runtime_trace::record_event(
                             "tool_call_result",
                             Some(channel_name),

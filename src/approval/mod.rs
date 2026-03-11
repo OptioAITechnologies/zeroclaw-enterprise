@@ -1,7 +1,27 @@
-//! Interactive approval workflow for supervised mode.
+//! Interactive and remote approval workflow for supervised mode.
 //!
-//! Provides a pre-execution hook that prompts the user before tool calls,
-//! with session-scoped "Always" allowlists and audit logging.
+//! Provides a pre-execution hook that either prompts the user on the CLI
+//! **or** calls a remote webhook before any tool executes.
+//!
+//! # Remote approval
+//!
+//! When `autonomy.remote_approval_url` is set in `config.toml`, **every**
+//! tool call is submitted to that URL regardless of `auto_approve` /
+//! `always_ask` / session-allowlist state.  The agent sends:
+//!
+//! ```json
+//! { "tool": "shell", "reason": "<LLM rationale text>", "params": { … } }
+//! ```
+//!
+//! The endpoint must respond with:
+//!
+//! ```json
+//! { "decision": "approve" }
+//! // or
+//! { "decision": "reject", "message": "optional reason" }
+//! ```
+//!
+//! Any network error or unrecognised response is treated as a rejection.
 
 use crate::config::AutonomyConfig;
 use crate::security::AutonomyLevel;
@@ -10,6 +30,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
+use std::time::Duration;
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -28,7 +49,7 @@ pub enum ApprovalResponse {
     Yes,
     /// Deny this call.
     No,
-    /// Execute and add tool to session-scoped allowlist.
+    /// Execute and add tool to session-scoped allowlist (CLI only).
     Always,
 }
 
@@ -42,17 +63,44 @@ pub struct ApprovalLogEntry {
     pub channel: String,
 }
 
+// ── Remote approval wire types ────────────────────────────────────
+
+/// JSON payload POSTed to the remote approval webhook for every tool call.
+#[derive(Debug, Clone, Serialize)]
+pub struct RemoteApprovalPayload<'a> {
+    /// Name of the tool the agent wants to execute.
+    pub tool: &'a str,
+    /// The LLM's rationale text that preceded this tool call (may be empty).
+    pub reason: &'a str,
+    /// Full tool parameters as a JSON object.
+    pub params: &'a serde_json::Value,
+}
+
+/// JSON response expected from the remote approval webhook.
+#[derive(Debug, Deserialize)]
+struct RemoteApprovalResult {
+    /// `"approve"` or `"reject"`.
+    decision: String,
+    /// Optional human-readable message (used in trace/log on rejection).
+    #[allow(dead_code)]
+    message: Option<String>,
+}
+
 // ── ApprovalManager ──────────────────────────────────────────────
 
-/// Manages the interactive approval workflow.
+/// Manages the interactive and remote approval workflow.
 ///
-/// - Checks config-level `auto_approve` / `always_ask` lists
-/// - Maintains a session-scoped "always" allowlist
-/// - Records an audit trail of all decisions
+/// Priority order:
+/// 1. If `remote_approval_url` is set → **always** call remote for every tool,
+///    ignoring all other lists.
+/// 2. Otherwise, local supervised-mode logic applies:
+///    - `always_ask` → always prompt on CLI
+///    - `auto_approve` / session allowlist → skip prompt
+///    - default → prompt on CLI
 pub struct ApprovalManager {
-    /// Tools that never need approval (from config).
+    /// Tools that never need local approval (from config).
     auto_approve: HashSet<String>,
-    /// Tools that always need approval, ignoring session allowlist.
+    /// Tools that always need local approval, ignoring session allowlist.
     always_ask: HashSet<String>,
     /// Autonomy level from config.
     autonomy_level: AutonomyLevel,
@@ -60,6 +108,12 @@ pub struct ApprovalManager {
     session_allowlist: Mutex<HashSet<String>>,
     /// Audit trail of approval decisions.
     audit_log: Mutex<Vec<ApprovalLogEntry>>,
+    /// Optional remote approval webhook URL.
+    remote_approval_url: Option<String>,
+    /// Timeout for remote approval HTTP requests.
+    remote_approval_timeout: Duration,
+    /// Optional Bearer token sent as `Authorization: Bearer <key>`.
+    remote_approval_api_key: Option<String>,
 }
 
 impl ApprovalManager {
@@ -71,12 +125,92 @@ impl ApprovalManager {
             autonomy_level: config.level,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
+            remote_approval_url: config.remote_approval_url.clone(),
+            remote_approval_timeout: Duration::from_secs(config.remote_approval_timeout_secs),
+            remote_approval_api_key: config.remote_approval_api_key.clone(),
         }
     }
 
-    /// Check whether a tool call requires interactive approval.
+    /// Returns `true` when a remote approval URL is configured.
     ///
-    /// Returns `true` if the call needs a prompt, `false` if it can proceed.
+    /// When this is `true`, **all** tool calls must be approved remotely —
+    /// the local `needs_approval` / `auto_approve` logic is bypassed entirely.
+    pub fn has_remote_approval(&self) -> bool {
+        self.remote_approval_url.is_some()
+    }
+
+    /// Submit a tool call to the remote approval webhook and return the decision.
+    ///
+    /// POSTs [`RemoteApprovalPayload`] as JSON and parses [`RemoteApprovalResult`].
+    /// Any error (network, timeout, unexpected body) returns [`ApprovalResponse::No`].
+    pub async fn request_remote_approval(
+        &self,
+        tool_name: &str,
+        reason: &str,
+        args: &serde_json::Value,
+    ) -> Result<ApprovalResponse, anyhow::Error> {
+        let url = match &self.remote_approval_url {
+            Some(u) => u.clone(),
+            None => anyhow::bail!("request_remote_approval called but no URL configured"),
+        };
+
+        let payload = RemoteApprovalPayload {
+            tool: tool_name,
+            reason,
+            params: args,
+        };
+
+        let client = reqwest::Client::builder()
+            .timeout(self.remote_approval_timeout)
+            .build()
+            .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {e}"))?;
+
+        let mut request = client.post(&url).json(&payload);
+        if let Some(key) = &self.remote_approval_api_key {
+            request = request.bearer_auth(key);
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("remote approval request failed: {e}"))?;
+
+        if !response.status().is_success() {
+            anyhow::bail!(
+                "remote approval endpoint returned HTTP {}",
+                response.status()
+            );
+        }
+
+        let result: RemoteApprovalResult = response
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to parse remote approval response: {e}"))?;
+
+        match result.decision.to_ascii_lowercase().as_str() {
+            "approve" => Ok(ApprovalResponse::Yes),
+            "reject" => {
+                if let Some(msg) = &result.message {
+                    tracing::info!(tool = %tool_name, reason = %msg, "remote approval rejected tool call");
+                }
+                Ok(ApprovalResponse::No)
+            }
+            other => {
+                tracing::warn!(
+                    tool = %tool_name,
+                    decision = %other,
+                    "remote approval endpoint returned unrecognised decision; treating as reject"
+                );
+                Ok(ApprovalResponse::No)
+            }
+        }
+    }
+
+    /// Check whether a tool call requires local interactive approval.
+    ///
+    /// Returns `true` if the call needs a CLI prompt, `false` if it can proceed.
+    ///
+    /// **Note:** this is only consulted when `has_remote_approval()` is `false`.
     pub fn needs_approval(&self, tool_name: &str) -> bool {
         // Full autonomy never prompts.
         if self.autonomy_level == AutonomyLevel::Full {
@@ -237,6 +371,15 @@ mod tests {
         }
     }
 
+    fn remote_config() -> AutonomyConfig {
+        AutonomyConfig {
+            level: AutonomyLevel::Supervised,
+            remote_approval_url: Some("http://localhost:9999/approve".into()),
+            remote_approval_timeout_secs: 5,
+            ..AutonomyConfig::default()
+        }
+    }
+
     // ── needs_approval ───────────────────────────────────────
 
     #[test]
@@ -275,6 +418,20 @@ mod tests {
         };
         let mgr = ApprovalManager::from_config(&config);
         assert!(!mgr.needs_approval("shell"));
+    }
+
+    // ── remote approval ──────────────────────────────────────
+
+    #[test]
+    fn has_remote_approval_when_url_set() {
+        let mgr = ApprovalManager::from_config(&remote_config());
+        assert!(mgr.has_remote_approval());
+    }
+
+    #[test]
+    fn no_remote_approval_when_url_absent() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        assert!(!mgr.has_remote_approval());
     }
 
     // ── session allowlist ────────────────────────────────────

@@ -1945,17 +1945,23 @@ pub struct BuiltinHooksConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AutonomyConfig {
     /// Autonomy level: `read_only`, `supervised` (default), or `full`.
+    #[serde(default)]
     pub level: AutonomyLevel,
     /// Restrict absolute filesystem paths to workspace-relative references. Default: `true`.
     /// Resolved paths outside the workspace still require `allowed_roots`.
+    #[serde(default = "default_true")]
     pub workspace_only: bool,
     /// Allowlist of executable names permitted for shell execution.
+    #[serde(default = "default_allowed_commands")]
     pub allowed_commands: Vec<String>,
     /// Explicit path denylist. Default includes system-critical paths and sensitive dotdirs.
+    #[serde(default = "default_forbidden_paths")]
     pub forbidden_paths: Vec<String>,
-    /// Maximum actions allowed per hour per policy. Default: `100`.
+    /// Maximum actions allowed per hour per policy. Default: `20`.
+    #[serde(default = "default_max_actions_per_hour")]
     pub max_actions_per_hour: u32,
-    /// Maximum cost per day in cents per policy. Default: `1000`.
+    /// Maximum cost per day in cents per policy. Default: `500`.
+    #[serde(default = "default_max_cost_per_day_cents")]
     pub max_cost_per_day_cents: u32,
 
     /// Require explicit approval for medium-risk shell commands.
@@ -1993,6 +1999,45 @@ pub struct AutonomyConfig {
     /// model in tool specs.
     #[serde(default)]
     pub non_cli_excluded_tools: Vec<String>,
+
+    /// Remote approval webhook URL.
+    ///
+    /// When set, **every** tool call — without exception — is sent to this URL
+    /// before execution.  The agent POSTs a JSON body:
+    ///
+    /// ```json
+    /// { "tool": "shell", "reason": "<LLM rationale text>", "params": { … } }
+    /// ```
+    ///
+    /// The endpoint must respond with a JSON body containing a `"decision"` field
+    /// whose value is either `"approve"` or `"reject"`:
+    ///
+    /// ```json
+    /// { "decision": "approve" }
+    /// { "decision": "reject", "message": "optional human-readable reason" }
+    /// ```
+    ///
+    /// A network error or an unrecognised response is treated as a rejection.
+    /// Setting this field overrides all local `auto_approve` / `always_ask` /
+    /// session-allowlist logic.
+    #[serde(default)]
+    pub remote_approval_url: Option<String>,
+
+    /// Timeout in seconds for each remote-approval HTTP request.
+    ///
+    /// If the remote endpoint does not respond within this window the call is
+    /// treated as rejected.  Default: `30`.
+    #[serde(default = "default_remote_approval_timeout_secs")]
+    pub remote_approval_timeout_secs: u64,
+
+    /// API key sent to the remote approval endpoint as
+    /// `Authorization: Bearer <key>`.
+    ///
+    /// Requests that arrive at the endpoint without this key (or with the wrong
+    /// value) should be rejected by the server with HTTP 401/403.
+    /// Leave unset to send no `Authorization` header.
+    #[serde(default)]
+    pub remote_approval_api_key: Option<String>,
 }
 
 fn default_auto_approve() -> Vec<String> {
@@ -2001,6 +2046,59 @@ fn default_auto_approve() -> Vec<String> {
 
 fn default_always_ask() -> Vec<String> {
     vec![]
+}
+
+fn default_remote_approval_timeout_secs() -> u64 {
+    30
+}
+
+fn default_allowed_commands() -> Vec<String> {
+    vec![
+        "git".into(),
+        "npm".into(),
+        "cargo".into(),
+        "ls".into(),
+        "cat".into(),
+        "grep".into(),
+        "find".into(),
+        "echo".into(),
+        "pwd".into(),
+        "wc".into(),
+        "head".into(),
+        "tail".into(),
+        "date".into(),
+    ]
+}
+
+fn default_forbidden_paths() -> Vec<String> {
+    vec![
+        "/etc".into(),
+        "/root".into(),
+        "/home".into(),
+        "/usr".into(),
+        "/bin".into(),
+        "/sbin".into(),
+        "/lib".into(),
+        "/opt".into(),
+        "/boot".into(),
+        "/dev".into(),
+        "/proc".into(),
+        "/sys".into(),
+        "/var".into(),
+        "/tmp".into(),
+        "~/.ssh".into(),
+        "~/.gnupg".into(),
+        "~/.aws".into(),
+        "~/.config".into(),
+    ]
+}
+
+fn default_max_actions_per_hour() -> u32 {
+    20
+}
+
+fn default_max_cost_per_day_cents() -> u32 {
+    500
 }
 
 fn is_valid_env_var_name(name: &str) -> bool {
@@ -2061,6 +2159,9 @@ impl Default for AutonomyConfig {
             always_ask: default_always_ask(),
             allowed_roots: Vec::new(),
             non_cli_excluded_tools: Vec::new(),
+            remote_approval_url: None,
+            remote_approval_timeout_secs: default_remote_approval_timeout_secs(),
+            remote_approval_api_key: None,
         }
     }
 }
