@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 pub struct OpenRouterProvider {
     credential: Option<String>,
+    base_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -149,7 +150,24 @@ impl OpenRouterProvider {
     pub fn new(credential: Option<&str>) -> Self {
         Self {
             credential: credential.map(ToString::to_string),
+            base_url: None,
         }
+    }
+
+    pub fn new_with_base_url(credential: Option<&str>, base_url: Option<&str>) -> Self {
+        Self {
+            credential: credential.map(ToString::to_string),
+            base_url: base_url
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .map(ToString::to_string),
+        }
+    }
+
+    fn chat_endpoint(&self) -> &str {
+        self.base_url
+            .as_deref()
+            .unwrap_or("https://openrouter.ai/api/v1/chat/completions")
     }
 
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
@@ -310,6 +328,10 @@ impl Provider for OpenRouterProvider {
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
+        // Skip warmup for custom base URLs — the /auth/key endpoint is OpenRouter-specific.
+        if self.base_url.is_some() {
+            return Ok(());
+        }
         // Hit a lightweight endpoint to establish TLS + HTTP/2 connection pool.
         // This prevents the first real chat request from timing out on cold start.
         if let Some(credential) = self.credential.as_ref() {
@@ -355,7 +377,7 @@ impl Provider for OpenRouterProvider {
 
         let response = self
             .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
+            .post(self.chat_endpoint())
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
@@ -402,7 +424,7 @@ impl Provider for OpenRouterProvider {
 
         let response = self
             .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
+            .post(self.chat_endpoint())
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
@@ -447,7 +469,7 @@ impl Provider for OpenRouterProvider {
 
         let response = self
             .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
+            .post(self.chat_endpoint())
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
@@ -538,7 +560,7 @@ impl Provider for OpenRouterProvider {
 
         let response = self
             .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
+            .post(self.chat_endpoint())
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
