@@ -827,6 +827,64 @@ fn install_git_skill_source(source: &str, skills_path: &Path) -> Result<(PathBuf
     }
 }
 
+fn install_enterprise_skill_source(source: &str, skills_path: &Path, api_url: &str) -> Result<(PathBuf, usize)> {
+    // Verify the source is a valid skill name
+    if source.contains("..") || source.contains('/')
+        || source.contains('\\') || source.contains('?')
+        || source.contains('#') || source.contains('%')
+        || source.contains('\0')
+    {
+        anyhow::bail!("Invalid skill name: {source}");
+    }
+
+    let dest = skills_path.join(source);  // simplified (see issue 3)
+    if dest.exists() {
+        anyhow::bail!("Destination skill already exists: {}", dest.display());
+    }
+
+    // Download the zip to a temp file using curl (same pattern as git clone above)
+    let tmp_zip = std::env::temp_dir().join(format!("zeroclaw-skill-{source}.zip"));
+    let output = std::process::Command::new("curl")
+        .args(["--fail", "--silent", "--show-error", "--location", "--output"])
+        .arg(&tmp_zip)
+        .arg(api_url)
+        .output()
+        .context("failed to run curl (is curl installed?)")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // curl may have written a partial file — clean it up before bailing
+        let _ = std::fs::remove_file(&tmp_zip);
+        anyhow::bail!("curl download failed: {stderr}");
+    }
+
+    // 3. Extract the zip into the destination directory.
+    //    Wrapped in a closure so the temp file is always cleaned up regardless of success/failure.
+    let extract_result = (|| -> Result<()> {
+        let file = std::fs::File::open(&tmp_zip)
+            .with_context(|| format!("failed to open downloaded zip: {}", tmp_zip.display()))?;
+        let mut archive = zip::ZipArchive::new(file)
+            .context("failed to parse zip archive")?;
+        archive.extract(&dest)
+            .with_context(|| format!("failed to extract skill to {}", dest.display()))?;
+        Ok(())
+    })();
+
+    // Always clean up the temp file — whether extraction succeeded or failed
+    let _ = std::fs::remove_file(&tmp_zip);
+
+    // Propagate any extraction error after cleanup
+    extract_result?;
+
+    // 4. Security audit + rollback on failure (mandatory — same as every other install fn)
+    match enforce_skill_security_audit(&dest) {
+        Ok(report) => Ok((dest, report.files_scanned)),
+        Err(err) => {
+            let _ = std::fs::remove_dir_all(&dest);
+            Err(err)
+        }
+    }
+}
+
 /// Handle the `skills` CLI command
 #[allow(clippy::too_many_lines)]
 pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Config) -> Result<()> {
@@ -909,26 +967,18 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             let skills_path = skills_dir(workspace_dir);
             std::fs::create_dir_all(&skills_path)?;
 
-            if is_git_source(&source) {
-                let (installed_dir, files_scanned) =
-                    install_git_skill_source(&source, &skills_path)
-                        .with_context(|| format!("failed to install git skill source: {source}"))?;
-                println!(
-                    "  {} Skill installed and audited: {} ({} files scanned)",
-                    console::style("✓").green().bold(),
-                    installed_dir.display(),
-                    files_scanned
-                );
-            } else {
-                let (dest, files_scanned) = install_local_skill_source(&source, &skills_path)
-                    .with_context(|| format!("failed to install local skill source: {source}"))?;
-                println!(
-                    "  {} Skill installed and audited: {} ({} files scanned)",
-                    console::style("✓").green().bold(),
-                    dest.display(),
-                    files_scanned
-                );
-            }
+            let api_url = config.skills.enterprise_skills_backend_url
+    .as_deref()
+    .context("Enterprise skills backend URL is not configured. Set ZEROCLAW_ENTERPRISE_SKILLS_BACKEND_URL or add enterprise_skills_backend_url to [skills] in config.toml")?;
+            let url = format!("{api_url}/api/skills/{source}/download");
+            let (installed_dir, files_scanned) = install_enterprise_skill_source(&source, &skills_path, &url)
+                .with_context(|| format!("failed to install enterprise skill source: {source}"))?;
+            println!(
+                "  {} Skill installed and audited: {} ({} files scanned)",
+                console::style("✓").green().bold(),
+                installed_dir.display(),
+                files_scanned
+            );
 
             println!("  Security audit completed successfully.");
             Ok(())

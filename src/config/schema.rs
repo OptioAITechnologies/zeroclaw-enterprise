@@ -471,6 +471,9 @@ pub struct SkillsConfig {
     /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
     #[serde(default)]
     pub prompt_injection_mode: SkillsPromptInjectionMode,
+    // Enterprise skills backend URL
+    #[serde(default)]
+    pub enterprise_skills_backend_url: Option<String>,
 }
 
 /// Multimodal (image) handling configuration (`[multimodal]` section).
@@ -4572,6 +4575,15 @@ impl Config {
                         "Ignoring invalid ZEROCLAW_SKILLS_PROMPT_MODE (valid: full|compact)"
                     );
                 }
+            }
+        }
+
+        // Enterprise skills backend URL: ZEROCLAW_ENTERPRISE_SKILLS_BACKEND_URL
+        if let Ok(url) = std::env::var("ZEROCLAW_ENTERPRISE_SKILLS_BACKEND_URL") {
+            if !url.trim().is_empty() {
+                self.skills.enterprise_skills_backend_url = Some(url.trim().to_string());
+            } else {
+                tracing::warn!("ZEROCLAW_ENTERPRISE_SKILLS_BACKEND_URL is not set, using default value");
             }
         }
 
