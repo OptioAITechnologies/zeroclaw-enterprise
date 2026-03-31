@@ -144,9 +144,23 @@ fn audit_path(root: &Path, path: &Path, report: &mut SkillAuditReport) -> Result
 }
 
 fn audit_markdown_file(root: &Path, path: &Path, report: &mut SkillAuditReport) -> Result<()> {
-    let content = fs::read_to_string(path)
+    let bytes = fs::read(path)
         .with_context(|| format!("failed to read markdown file {}", path.display()))?;
     let rel = relative_display(root, path);
+    let content = match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            // A file with a .md extension that contains non-UTF-8 (binary) data cannot be
+            // valid markdown and cannot be safely content-scanned.  This most commonly
+            // happens with Apple Double resource-fork sidecars (._*) that macOS injects
+            // into ZIP archives.  Record a finding and return cleanly so the auditor does
+            // not crash; the caller will reject the skill if the report is not clean.
+            report.findings.push(format!(
+                "{rel}: file has a .md extension but contains non-UTF-8 (binary) content."
+            ));
+            return Ok(());
+        }
+    };
 
     if let Some(pattern) = detect_high_risk_snippet(&content) {
         report.findings.push(format!(

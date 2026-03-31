@@ -864,8 +864,43 @@ fn install_enterprise_skill_source(source: &str, skills_path: &Path, api_url: &s
             .with_context(|| format!("failed to open downloaded zip: {}", tmp_zip.display()))?;
         let mut archive = zip::ZipArchive::new(file)
             .context("failed to parse zip archive")?;
-        archive.extract(&dest)
-            .with_context(|| format!("failed to extract skill to {}", dest.display()))?;
+
+        std::fs::create_dir_all(&dest)
+            .with_context(|| format!("failed to create skill directory {}", dest.display()))?;
+
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i)
+                .with_context(|| format!("failed to read zip entry {i}"))?;
+
+            // Skip macOS metadata injected by macOS's zip implementation:
+            //   __MACOSX/ — the metadata container directory
+            //   ._*       — Apple Double resource-fork sidecars (binary, not UTF-8)
+            // These are never valid skill content and would cause the security auditor
+            // to crash when it tries to read them as UTF-8 text.
+            let raw_name = entry.name().to_string();
+            let first_component = raw_name.split('/').next().unwrap_or("");
+            let file_name = raw_name.split('/').filter(|s| !s.is_empty()).last().unwrap_or("");
+            if first_component == "__MACOSX" || file_name.starts_with("._") {
+                continue;
+            }
+
+            let out_path = dest.join(entry.mangled_name());
+
+            if entry.is_dir() {
+                std::fs::create_dir_all(&out_path)
+                    .with_context(|| format!("failed to create directory {}", out_path.display()))?;
+            } else {
+                if let Some(parent) = out_path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("failed to create parent directory {}", parent.display()))?;
+                }
+                let mut outfile = std::fs::File::create(&out_path)
+                    .with_context(|| format!("failed to create file {}", out_path.display()))?;
+                std::io::copy(&mut entry, &mut outfile)
+                    .with_context(|| format!("failed to write {}", out_path.display()))?;
+            }
+        }
+
         Ok(())
     })();
 
