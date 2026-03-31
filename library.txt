@@ -1,0 +1,15 @@
+# Recommended server package and runtime versions
+# Canonical source file. Sync this into `~/.zeroclaw/workspace/library.txt`
+# before running the automated patch audit skill.
+# Format: <kind>|<name>|<recommended_version>|<check_method>|<notes>
+# kind: apt | binary
+# check_method: dpkg-query | command
+# notes are informational only
+
+apt|git|1:2.39.5-0+deb12u3|dpkg-query|Recommended git package version for this host
+apt|nodejs|20.20.1-1nodesource1|dpkg-query|Recommended Node.js package version for this host
+apt|python3|3.11.2-1+b1|dpkg-query|Recommended Python 3 package version for this host
+binary|node|v20.20.1|command|Expected output from `node --version`
+binary|npm|10.8.2|command|Expected output from `npm --version`
+binary|git|2.39.5|command|Expected semantic version from `git --version`
+binary|docker|29.3.0|command|Expected semantic version from `docker --version`
